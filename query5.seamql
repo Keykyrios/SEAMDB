@@ -1,0 +1,7 @@
+spawn table staff: id: whole number, main key, dept: text, amount: whole number, needed
+drop in staff { id: 1, dept: 'eng', amount: 10 }
+drop in staff { id: 2, dept: 'eng', amount: 20 }
+drop in staff { id: 3, dept: 'ops', amount: 5 }
+pull dept, tally(1) as headcount, stack(amount) as total
+  from staff
+  bunch by dept

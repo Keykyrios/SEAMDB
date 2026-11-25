@@ -1,0 +1,28 @@
+version: seamql/0.1
+errors:
+  E_SYNTAX: { http: 400, hint: "Check the statement against seamql/0.1." }
+  E_TRAILING: { http: 400, hint: "Remove extra tokens after the statement." }
+  E_BAD_UTF8: { http: 400, hint: "Supply valid UTF-8." }
+  E_BAD_ESCAPE: { http: 400, hint: "Only \\n \\t \\\\ \\' and doubled quotes are allowed." }
+  E_IDENT_UNICODE: { http: 400, hint: "Unquoted names are ASCII. Quote if you must preserve spelling." }
+  E_TOKEN_LIMIT: { http: 400, hint: "Split the statement; max token is 1 MiB." }
+  E_TYPE_MISMATCH: { http: 400, hint: "No implicit conversion was performed." }
+  E_OVERFLOW: { http: 400, hint: "Use a value inside the declared precision." }
+  E_DIV_ZERO: { http: 400, hint: "Division by zero is an error." }
+  E_UNKNOWN_NAME: { http: 404, hint: "Check object names you are allowed to see." }
+  E_AMBIGUOUS: { http: 400, hint: "Qualify the column with the table name." }
+  E_NEEDED: { http: 400, hint: "This column is needed (NOT NULL)." }
+  E_UNIQUE: { http: 409, hint: "A visible row already uses this key." }
+  E_FK: { http: 409, hint: "The linked row is not visible." }
+  E_DENIED: { http: 403, hint: "Ask an owner to let your role use this object." }
+  E_CONFLICT: { http: 409, hint: "Another transaction wrote this row. Dip or retry." }
+  E_TX_STATE: { http: 400, hint: "Start tx, lock in, or dip in a valid order." }
+  E_FEATURE_NOT_SUPPORTED: { http: 501, hint: "This construct is not in seamql/0.1." }
+  E_CHECKSUM: { http: 500, hint: "Page failed CRC. Restore from backup." }
+  E_WAL_CORRUPT: { http: 500, hint: "WAL failed closed. Do not ignore this." }
+  E_COMMIT_AMBIGUOUS: { http: 503, hint: "Lookup xid status; do not retry blindly." }
+  E_LIMIT: { http: 429, hint: "Query exceeded rows, memory, or time." }
+  E_CORRUPT: { http: 500, hint: "Storage invariant failed." }
+  E_LOCK: { http: 409, hint: "Another process owns this database directory." }
+  E_KEY: { http: 500, hint: "Key missing or production mode blocked a dev key." }
+  E_POLICY_FAIL: { http: 403, hint: "Policy evaluation failed closed." }

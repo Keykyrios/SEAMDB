@@ -1,0 +1,110 @@
+-- ============================================================
+-- SEAMDB Studio — copy-paste demo scripts.
+-- Every block below was executed verbatim against seamdb on
+-- this machine and returned the shown results. Paste ONE block
+-- per tab, press Ctrl+Enter (or Run).
+-- ============================================================
+
+-- ------------------------------------------------------------
+-- 1) Hello SEAMQL — build a table, insert, query
+--    (fresh sessions start empty; the Studio keeps one engine
+--     per tab chain)
+-- ------------------------------------------------------------
+spawn table folks: id: whole number, main key, name: text, needed
+drop in folks { id: 1, name: 'Ada' }
+drop in folks { id: 2, name: 'Grace' }
+pull name from folks when id = 1        -- → Ada
+
+-- ------------------------------------------------------------
+-- 2) LeetCode 183 — Customers Who Never Order
+--    spawn = CREATE TABLE · drop in = INSERT · left link = LEFT JOIN
+--    Answer comes back as: Grace, Linus
+-- ------------------------------------------------------------
+spawn table runs: rid: whole number, main key, folks_id: whole number, needed, links to folks.id, amount: decimal(12, 2), needed
+drop in runs { rid: 1, folks_id: 1, amount: 10.00 }
+pull folks.name as customers
+  from folks
+  left link runs on folks.id = runs.folks_id
+  when runs.rid is null
+
+-- ------------------------------------------------------------
+-- 3) Aggregates — bunch by (GROUP BY), tally (COUNT), stack (SUM)
+--    observed result: eng 2 · 30  |  ops 1 · 5
+-- ------------------------------------------------------------
+spawn table staff: id: whole number, main key, dept: text, amount: whole number, needed
+drop in staff { id: 1, dept: 'eng', amount: 10 }
+drop in staff { id: 2, dept: 'eng', amount: 20 }
+drop in staff { id: 3, dept: 'ops', amount: 5 }
+pull dept, tally(1) as headcount, stack(amount) as total
+  from staff
+  bunch by dept
+
+-- ------------------------------------------------------------
+-- 4) Sort, cap, skip — rank by … high to low (ORDER BY DESC),
+--    cap (LIMIT), skip (OFFSET)
+--    observed result: 3, 2   (amount high to low, first two)
+-- ------------------------------------------------------------
+pull id, dept, amount from staff
+  rank by amount high to low
+  cap 2
+
+-- ------------------------------------------------------------
+-- 5) Window function — rank() over (partition/order)
+--    observed: every row keeps its rank alongside its id
+-- ------------------------------------------------------------
+pull id, dept, rank() over (rank by amount high to low) as rk
+  from staff
+
+-- ------------------------------------------------------------
+-- 6) Cast — numeric/other value to a string column
+--    observed: 'Ada'
+-- ------------------------------------------------------------
+pull cast(id as text) as s from folks when id = 1
+
+-- ------------------------------------------------------------
+-- 7) Views — create once, query like a table
+--    observed from the view: eng, ops
+-- ------------------------------------------------------------
+create view heads as pull dept from staff bunch by dept
+pull dept from heads
+
+-- ------------------------------------------------------------
+-- 8) CTE — with name as ( pull … )
+--    observed: rows with id above zero, through the CTE
+-- ------------------------------------------------------------
+with active as (pull id from staff when amount > 0)
+pull id from active
+
+-- ------------------------------------------------------------
+-- 9) Set operations — union all between two pulls
+-- ------------------------------------------------------------
+pull id from folks when id = 1
+union all
+pull id from staff when id = 3
+
+-- ------------------------------------------------------------
+-- 10) MVCC abort — the row that vanishes
+--     The mid-transaction pull sees id 9; after dip (rollback)
+--     the same pull returns nothing. The write never happened.
+-- ------------------------------------------------------------
+start tx
+drop in folks { id: 9, name: 'Ghost' }
+pull id from folks when id = 9    -- sees its own write
+dip                               -- ROLLBACK; nothing persists
+pull id from folks when id = 9    -- → empty
+
+-- ------------------------------------------------------------
+-- 11) Fail closed — typed errors, statement by statement
+--     E_UNIQUE · E_UNKNOWN_NAME  (each card shows its own error,
+--     the script keeps running past failures)
+-- ------------------------------------------------------------
+drop in folks { id: 1, name: 'Mallory' }   -- E_UNIQUE (main key)
+pull ghost from folks                      -- E_UNKNOWN_NAME
+
+-- ------------------------------------------------------------
+-- 12) Index + physical plan — spill shows the plan flip
+--     Before/after the index, the same query plans differently:
+--     HeapScan → IndexPoint after `add index`
+-- ------------------------------------------------------------
+add index folks_by_name on folks (name)
+spill pull name from folks when name = 'Ada'

@@ -1,0 +1,718 @@
+% SEAMDB -- design and rationale document.
+% Compile on Overleaf (pdfLaTeX). Only ubiquitous packages are used:
+% geometry, xcolor, hyperref, booktabs, listings. No shell-escape, no minted.
+% Source is ASCII-only on purpose (matches the repository lint rule).
+
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{listings}
+\usepackage{hyperref}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!50!black,
+  urlcolor=blue!50!black,
+  pdftitle={SEAMDB: a proof-carrying evidence plane over a from-scratch relational engine},
+  pdfauthor={Mitrajit Ghorui},
+}
+
+\definecolor{codebg}{RGB}{246,246,244}
+\definecolor{codekw}{RGB}{16,92,168}
+\definecolor{codecm}{RGB}{96,128,96}
+
+\lstdefinelanguage{SEAMQL}{
+  morekeywords={spawn,make,table,drop,in,add,index,on,let,allow,block,deny,
+    tweak,update,yeet,remove,pull,read,from,left,inner,link,join,when,where,
+    bunch,group,by,rank,sort,cap,take,start,begin,tx,lockin,commit,dip,cancel,
+    spill,explain,main,key,needed,links,to,whole,number,text,decimal,bool,
+    stamp,day,as,and,or,not,is,null,check,ship,true,false},
+  sensitive=true,
+  morecomment=[l]{--},
+  morestring=[b]',
+}
+\lstset{
+  language=SEAMQL,
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{codekw}\bfseries,
+  commentstyle=\color{codecm}\itshape,
+  stringstyle=\ttfamily,
+  backgroundcolor=\color{codebg},
+  frame=single,
+  rulecolor=gray!40,
+  columns=flexible,
+  keepspaces=true,
+  showstringspaces=false,
+  breaklines=true,
+  aboveskip=0.8em,
+  belowskip=0.8em,
+}
+\newcommand{\seamql}{\lstinline[language=SEAMQL]}
+\newcommand{\code}[1]{\texttt{#1}}
+
+\title{SEAMDB: A Proof-Carrying Evidence Plane\\Over a From-Scratch Relational Engine}
+\author{Mitrajit Ghorui \\ Genauix}
+\date{October 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Regulated data handoffs (model exports, claims extracts, cross-org feature
+feeds) fail today for an evidentiary reason rather than a storage reason: the
+receiver cannot prove \emph{what} left, \emph{under which policy}, from
+\emph{which source snapshot}, and whether the sender later rewrote history.
+SEAMDB answers that with an \emph{Evidence Capsule}: a canonicalized,
+content-addressed bundle -- source snapshot roots, lineage closure, policy
+decision digest, execution appraisal, result root, and a transparency-log
+receipt -- that an auditor verifies \emph{offline}, where any mismatch exits
+nonzero. Underneath, SEAMDB is also a complete relational engine written from
+scratch in TypeScript (typed pages, CRC-checked WAL, snapshot-isolation MVCC,
+B$+$tree, and a query language called SEAMQL), because the evidence plane must
+own the write path to fingerprint statements, plans, and write sets. This
+document describes the architecture end to end, justifies each design choice
+against the obvious alternatives (Redis, PostgreSQL, SQLite, MongoDB, DuckDB,
+audit tables, external transparency logs, ad-hoc export scripts), states the
+advantages honestly, and lists the limitations without decoration. The whole
+system is verifiable: 204 engine tests, a ten-attack adversarial gallery, and
+known-answer vectors all run offline. The same engine serves clients over a
+framed wire protocol: a five-page web site (home, SQL IDE, SECP lab, specs,
+docs) that runs it in the browser, and a native PyQt6 desktop IDE (SEAMDB
+Studio) with a schema explorer, syntax-highlighted editors and a results
+grid, driven by a Python client. The wire layer is one protocol (frame types
+1--8: hello, auth, query, result, error, cancel, status, catalog) with a
+length-prefix transport; both languages bind to identical semantics. The
+Python smoke run and the catalog introspection are covered by the test
+suite, and the desktop IDE ships a Qt syntax highlighter kept in sync with
+the canonical SEAMQL keyword surface.
+\end{abstract}
+
+\tableofcontents
+
+% =====================================================================
+\section{The problem: exports without custody}
+\label{sec:problem}
+
+An export pipeline in a regulated setting is a custody chain: source systems
+of record, a transformation, a policy decision, a destination. Today that
+chain is documented, not \emph{evidenced}. When an auditor asks ``prove that
+this file came from the March claims snapshot, under policy bundle 42, and was
+not modified afterwards,'' the answer is a pile of logs that must be trusted
+wherever they were written. Three concrete failure modes motivate SEAMDB:
+
+\begin{enumerate}
+  \item \textbf{Silent rewrite.} The sender can regenerate the export from
+    different inputs and the receiver has no commitment that pins the
+    original. Hashing the final file only proves the file was not changed in
+    transit -- it says nothing about \emph{which inputs} produced it.
+  \item \textbf{Policy theater.} Approvals live in tickets and wikis, not in
+    the artifact. Nothing stops the next export from ignoring the decision,
+    and a stale approval looks identical to a fresh one.
+  \item \textbf{Evidence that only the author can check.} Most ``audit''
+    features require calling back into the producer's systems, so the party
+    under investigation is also the party running the verification.
+\end{enumerate}
+
+SEAMDB's thesis: \emph{every high-risk export must carry its own
+verification, checkable by anyone, without calling home.}
+
+% =====================================================================
+\section{What SEAMDB is}
+\label{sec:what}
+
+SEAMDB has two coupled halves:
+
+\begin{itemize}
+  \item An \textbf{evidence plane}: canonicalization, keyed Merkle
+    commitments, a transparency log with signed checkpoints, witness
+    acknowledgements, a policy gate, an execution appraisal, one-use release
+    grants, and the Evidence Capsule itself -- a single wire object whose
+    digest covers every sealed field.
+  \item A \textbf{relational engine written from scratch} (SEAMDB Engine):
+    16\,KiB pages with CRC32 on every read, a write-ahead log with
+    ARIES-style analysis/redo/undo recovery, snapshot-isolation MVCC, a
+    B$+$tree with unaligned slot pages, a buffer cache, page-level
+    AES-256-GCM encryption, and SEAMQL -- a typed query language with
+    lexer, parser, resolver, and planner implemented in this repository.
+\end{itemize}
+
+The engine is not a vanity project: the evidence plane must be able to say
+\emph{which statement, which plan, which write set} produced a result, and
+that is only honest if the database itself emits those fingerprints. A
+Postgres adapter could be added later as a capture connector; the built-in
+engine is the reference implementation and the browser-runnable demo.
+
+SEAMDB is an \emph{overlay}, not a replacement warehouse: source systems stay
+systems of record; capture is read-only; raw payloads stay in
+customer-controlled storage. What crosses the boundary is the capsule.
+
+% =====================================================================
+\section{Architecture}
+\label{sec:architecture}
+
+\begin{verbatim}
+  customer data plane             SEAMDB control plane
+  (Postgres, warehouse,    -->   intent / snapshot / seal /
+   feature store: SoR)            grant / verify (in process)
+          |                                |
+          | read-only capture              | SECP/0.1 state machine
+          v                                v
+  +----------------------------------------------------------+
+  | evidence plane: JCS canon -> keyed Merkle -> capsule     |
+  | digest -> transparency log -> witnesses -> verifier      |
+  +----------------------------------------------------------+
+          |                                |
+          v                                v
+  trust plane (split duty)         consumer plane (auditor)
+  log checkpoints, witnesses,      capsule + npm run verify,
+  offline verifier CLI             exit 0 only on full PASS
+\end{verbatim}
+
+\subsection{Data plane}
+Sources register a schema and a connector version; capture snapshots rows
+under a keyed Merkle tree (HMAC-SHA-384 leaves, domain-tagged
+\code{SEAMDB/TLOG-LEAF/V1}-style per-purpose tags). Identical snapshot tokens
+produce identical roots, so a re-capture is provably the same data.
+
+\subsection{Control plane}
+An in-process API with SECP/0.1 semantics: \code{intent}, \code{snapshot},
+\code{seal}, \code{grant}, \code{verify}. Illegal state transitions throw;
+\code{DENIED} is absorbing except from \code{RELEASED}. The operator may
+authorize a release but cannot mutate a sealed snapshot without changing its
+digest -- the enforcement is algebraic, not procedural.
+
+\subsection{Evidence plane}
+RFC 8785 JSON Canonicalization Scheme (JCS) produces the byte string that
+gets hashed; pretty-JSON hashing is treated as a defect. Every commitment is
+SHA-384 with an explicit domain tag; leaves are keyed (HMAC) so an adversary
+cannot grind alternative leaf preimages without the commitment secret. The
+capsule digest is
+\[
+  \mathrm{SHA384}\big(\texttt{SEAMDB/CAPSULE/V1}\,\|\,\mathrm{JCS}(\mathrm{body})\big),
+\]
+which covers policy purpose and destination, execution profile, result root,
+row count, key epoch, and the transparency pointers. Mutating any sealed
+field changes the digest -- this is enforced by tests that mutate each field
+in turn and assert the digest moves.
+
+\subsection{Trust plane}
+Checkpoints over the log are signed with the runtime's classical signature
+algorithm -- Ed25519 where WebCrypto provides it, ECDSA P-384 (FIPS 186-5)
+otherwise -- and \emph{every checkpoint names which algorithm produced it}.
+Witness acknowledgements (quorum 2 in the demo) bind witnesses to
+checkpoint roots; \code{detectSplit} flags equivocation: same tree size,
+different root. The verifier CLI is a sibling script of the attack gallery,
+so the party checking evidence is not the party that produced it.
+
+\subsection{Consumer plane}
+The auditor receives the capsule plus proofs and runs \code{npm run verify}
+offline. Exit code 0 only on a full PASS across all named checks;
+\code{INDETERMINATE} is explicitly not a release signal. There is no network
+access in the verifier path at all.
+
+% =====================================================================
+\section{Storage engine}
+\label{sec:storage}
+
+\subsection{Pages and encoding}
+Pages are 16{,}384 bytes (a power of two that fits NVMe and object-store
+multipart boundaries), each prefixed by a header and protected by CRC32
+verified on \emph{every} read -- a corrupted page fails closed with a typed
+code (\code{E\_CORRUPT}) rather than serving damaged rows. Slot pages use
+unaligned variable-length records, so text and decimals do not pay for
+maximum-width padding. Values are typed: \emph{whole number} (int64),
+\emph{decimal(p,s)} (exact, no binary float), \emph{text}, \emph{bool},
+\emph{stamp}, \emph{day}. There is no implicit numeric conversion; a type
+mismatch raises \code{E\_TYPE\_MISMATCH} at resolve time.
+
+\subsection{Write-ahead log and recovery}
+Every commit is durable in the WAL before acknowledgment. The WAL itself is
+CRC-framed; recovery performs ARIES-style analysis, redo of committed work,
+and undo of loser transactions, then writes a checkpoint. The crash matrix
+tests tear the log at adversarial byte offsets (including split frames) and
+require byte-exact logical recovery or a clean fail-closed refusal --
+never a partially applied transaction.
+
+\subsection{MVCC}
+Readers operate on snapshots (transaction id plus an active-transaction set);
+writers create new versions instead of overwriting. Consequences that the
+IDE demonstrates live: an explicit transaction sees its own writes, other
+sessions never see uncommitted rows, and \seamql{dip} (abort) makes every
+write vanish -- the demo script inserts inside a transaction, reads it back,
+aborts, and shows the row gone. Locking is per main-key with a deadlock-free
+acquisition order; a second \seamql{dip} without a transaction raises
+\code{E\_TX\_STATE}.
+
+\subsection{B$+$tree and planner}
+Secondary indexes are B$+$trees over typed keys. The planner is honest about
+what it does: \seamql{spill} (explain) prints the physical plan, and the
+SQL IDE page snippet shows the plan flip from
+\code{HeapScan(people) -> Filter -> Project} to
+\code{IndexPoint(people.people\_by\_id) -> Filter -> Project} after
+\seamql{add index} -- the same query, the same rows, a different access path
+the user can see.
+
+\subsection{Encryption at rest}
+Page-level AES-256-GCM: data keys are derived per object from a tenant
+secret via HKDF-SHA-384 with a key-epoch salt, and every page's additional
+authenticated data binds tenant, object, type, schema version, and epoch.
+A page moved between objects or epochs fails authentication instead of
+decrypting. KMS/HSM custody is \emph{simulated} (envelope keys over real
+AES-256-GCM) in this build and labeled as such everywhere it appears.
+
+% =====================================================================
+\section{SEAMQL}
+\label{sec:seamql}
+
+SEAMQL is a small typed language designed for auditability: every construct
+maps to one engine operation, and every operation can fail only in ways the
+error catalog enumerates. A representative script:
+
+\begin{lstlisting}
+-- DDL: catalog write, WAL-cat
+spawn table folks: id: whole number, main key,
+                    name: text, needed
+spawn table runs:  rid: whole number, main key,
+                    folks_id: whole number, needed,
+                    links to folks.id,
+                    amount: decimal(12, 2), needed
+
+drop in folks { id: 1, name: 'Ada' }
+drop in folks { id: 2, name: 'Grace' }
+drop in folks { id: 3, name: 'Linus' }
+drop in runs  { rid: 1, folks_id: 1, amount: 10.00 }
+
+-- LEFT JOIN: unmatched customers null-extend
+pull folks.name as customers
+  from folks
+  left link runs on folks.id = runs.folks_id
+  when runs.rid is null
+\end{lstlisting}
+
+This is LeetCode 183 (``Customers Who Never Order''), executed verbatim by
+\code{tests/demo-proof.test.ts} and by the browser IDE on the SQL IDE page
+(/ide.html), returning \code{Grace, Linus}. The language surface: \seamql{spawn} (DDL),
+\seamql{drop in} (insert), \seamql{tweak} (update), \seamql{yeet} (delete),
+\seamql{pull} with \seamql{left link}/\seamql{join}, \seamql{when} filters,
+\seamql{bunch by} (group), \seamql{rank by} (order), \seamql{cap} (limit),
+\seamql{add index}, \seamql{start tx} / \seamql{lockin} / \seamql{dip},
+\seamql{spill} (explain), and \seamql{let}/\seamql{block} row policies.
+Constraints are enforced by the engine, not the application: re-inserting a
+main key raises \code{E\_UNIQUE}; a dangling foreign key raises \code{E\_FK}.
+
+\subsection{Errors are typed}
+Every failure carries a stable code and a source position: \code{E\_UNIQUE},
+\code{E\_FK}, \code{E\_UNKNOWN\_NAME}, \code{E\_TYPE\_MISMATCH},
+\code{E\_TX\_STATE}, \code{E\_LIMIT}, \code{E\_CORRUPT},
+\code{E\_WAL\_CORRUPT}, \code{E\_DENIED}, \code{E\_CRYPTO},
+\code{E\_FEATURE\_NOT\_SUPPORTED}. The IDE renders them per statement and
+keeps executing subsequent statements, so a demo script can show three
+different typed failures in one run -- which is exactly what the ``Fail
+closed'' snippet on the SQL IDE page does.
+
+% =====================================================================
+\section{Evidence plane in detail}
+\label{sec:evidence}
+
+\subsection{Canonicalization}
+JCS fixes one byte representation per JSON value (sorted keys, no
+whitespace, shortest-number form). All digests in the system are taken over
+canonical bytes or over explicitly domain-tagged byte strings -- never over
+``whatever \code{JSON.stringify} emitted this run.'' The canonicalizer is
+covered by known-answer vectors.
+
+\subsection{Merkle profile}
+Leaves are \code{H(0x00 || tag || keyed(row))}, nodes are
+\code{H(0x01 || tag || left || right)}, empty trees hash a dedicated empty
+tag, and odd nodes promote (RFC 9162-shaped). Inclusion and consistency
+proofs are verified by the offline verifier; the known-answer suite pins
+tree shapes (including 0, 1, and odd leaf counts).
+
+\subsection{Transparency log}
+Every sealed capsule appends a leaf; each append emits a signed checkpoint
+plus an inclusion proof and, when applicable, a consistency proof.
+Equivocation detection compares local and remote checkpoints at equal tree
+sizes. The demo witnesses are simulated (HMAC-based acknowledgements), and
+the documentation says so -- the \emph{logic} of quorum checking and split
+detection is real; the federation is not.
+
+\subsection{The nine-gate filtration (SECP/0.1)}
+\code{INTENT\_CREATED} $\rightarrow$ \code{SOURCE\_COMMITTED} $\rightarrow$
+\code{LINEAGE\_CLOSED} $\rightarrow$
+\code{POLICY\_APPRAISED} $\rightarrow$ \code{EXECUTION\_APPRAISED}
+$\rightarrow$ \code{RESULT\_COMMITTED} $\rightarrow$
+\code{CAPSULE\_SEALED} $\rightarrow$ \code{RECEIPT\_VERIFIED}
+$\rightarrow$ \code{RELEASED}, with \code{DENIED} absorbing. Each gate
+corresponds to a named check in the verifier; an illegal transition throws.
+
+\subsection{Policy and grants}
+The policy decision binds purpose, destination, data classes, query profile,
+row/byte caps, an expiry, a one-use nonce, and the policy bundle digest. A
+stale bundle digest (\code{sha384:dead} in the demo) or an open critical
+discrepancy denies the grant. Grants are one-use and bound to the capsule
+digest: replaying a consumed grant fails closed.
+
+\subsection{Coherence and algebraic checks}
+Discrepancy witnesses compare overlapping views (same \code{member\_ref}
+key) and \emph{retain} the residual rather than silently resolving it; an
+algebraic conservation check asserts that input sums equal output sums over
+the overlap. An MDL-style compression residual scores anomaly-ness and is
+explicitly labeled ``not Kolmogorov complexity $K(x)$.''
+
+\subsection{The verifier}
+\code{npm run verify} runs every named check over an exported bundle with no
+network access: capsule digest recomputation, inclusion and consistency
+proofs, witness quorum, policy binding, appraisal, conservation, and grant
+state. Verdicts are \code{PASS}/\code{FAIL}/\code{INDETERMINATE}; anything
+but full PASS exits nonzero. The adversarial gallery seeds at least ten
+attacks (leaf tamper, purpose swap, policy stale-roll, grant replay,
+equivocation, downgrade, \ldots) and the suite asserts each is blocked.
+
+% =====================================================================
+\section{Cryptography profile}
+\label{sec:crypto}
+
+All primitives are imported, never invented; the repo's injection-surface
+constraints (Section~\ref{sec:constraints}) forbid \code{eval}, dynamic
+\code{require}, and WebAssembly outright.
+
+\begin{center}
+\begin{tabular}{@{}llp{7.6cm}@{}}
+\toprule
+Purpose & Primitive & Notes \\
+\midrule
+Commitments & SHA-384 (WebCrypto) & domain-tagged per use \\
+Keyed leaves & HMAC-SHA-384 & commitment secret never leaves process \\
+Encryption & AES-256-GCM & 12-byte nonce, AAD binds object + epoch \\
+Key derivation & HKDF-SHA-384 & per-object DEK, epoch salt \\
+Transport & ML-KEM-768 + X25519 & hybrid, FIPS 203 via @noble/post-quantum \\
+Transport fallback & ML-KEM-768 + ECDH P-256 & where WebCrypto lacks X25519 \\
+Checkpoints & Ed25519 or ECDSA P-384 & per-checkpoint algorithm label \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Hybrid transport, honestly labeled}
+The transport handshake mirrors the TLS~1.3 \code{X25519MLKEM768} hybrid
+group: both an ephemeral classical agreement and ML-KEM-768 encapsulation run
+per session, and the KEM shared secret is a \emph{mandatory} HKDF input --
+a classical-only peer derives a different traffic secret, so the handshake
+cannot be silently downgraded. Both encapsulation keys (by SHA-384 digest)
+and the agreement group are folded into the \code{info} string. Every
+negotiation record names the groups that actually ran; on runtimes whose
+WebCrypto lacks X25519 (some browser builds), the engine falls back to
+ECDH P-256 and says so in the profile label and note. The fallback choice
+comes from probing the local runtime only -- never from wire input -- so an
+attacker cannot force it.
+
+\subsection{Signature agility with labels}
+Likewise, checkpoint signatures use Ed25519 where available and ECDSA
+P-384 otherwise, and every checkpoint carries an \code{alg} field. The
+product rule behind both mechanisms: \emph{the record says what happened};
+the UI never prints a stronger claim than the runtime executed. This is why
+the site can promise ``hybrid PQ transport'' and ``classical
+signatures'' on a browser build that lacks X25519/Ed25519 without lying --
+it runs P-256 and labels it.
+
+\subsection{What the crypto does not claim}
+PQ is transport only: there are no PQ signatures, and ML-KEM never
+``attests'' a capsule. The system is not a custom cipher, not a TLS stack,
+and not a zero-knowledge proof system. Timestamps in the demo are host-local
+(a real deployment needs a trusted timestamping source).
+
+% =====================================================================
+\section{Why not the other database?}
+\label{sec:alternatives}
+
+The most common reactions to SEAMDB, and the honest answers.
+
+\subsection{``Just use Redis.''}
+Redis is an excellent in-memory data structure server and a superb cache and
+broker. It was never asked to produce export evidence: keys hold opaque
+values the server does not interpret; persistence (AOF/RDB) trades durability
+windows for speed by design; there is no snapshot isolation between
+commands; there is no query language with joins, types, and constraints; and
+nothing in the trust story lets an auditor verify an export offline. The
+question is not ``which stores data faster'' -- Redis wins that -- but
+``which store's writes carry proof.'' Cache vs.\ custody. Keep Redis as a
+cache; it does not become evidence infrastructure by adding a hashing
+wrapper.
+
+\subsection{``Just use PostgreSQL.''}
+Postgres is the correct default for almost everything, and SEAMDB assumes it
+as a system of record. But the evidence question lives \emph{above} any
+single database: Postgres gives you MVCC, WAL, and logical replication --
+all excellent -- and no capsule. A logical-decoding-based exporter in front
+of Postgres can capture change streams, but then the evidence plane must
+still be built: canonicalization, keyed commitments, policy binding,
+transparency log, offline verifier. That is precisely the layer SEAMDB
+\emph{is}. Using Postgres for storage would trade a from-scratch engine
+(Section~\ref{sec:limitations}: single writer, no parallel query) for a
+dependency whose internals the capsule cannot fingerprint end to end. Both
+positions are defensible; SEAMDB chose the one where every fingerprint --
+statement, plan, write set -- originates in code we can show.
+
+\subsection{``Just use SQLite.''}
+SQLite is a marvel of engineering: embeddable, battle-tested, and its WAL
+mode is excellent. It also has no multi-writer story for our target
+deployment, no network protocol by design (which is fine -- SEAMDB's
+protocol is also in-process), and, decisively, no evidence plane: its
+\code{dbstat}/dump artifacts prove shape, not custody. SEAMDB's engine is in
+the same embeddable spirit but adds the parts SQLite deliberately excludes:
+typed constraint enforcement with typed errors, keyed commitments per
+snapshot, statement/plan digests in the log, and a capsule format.
+
+\subsection{``Just use MongoDB (or any document store).'''}
+Document stores optimize schema flexibility; SEAMDB optimizes schema
+\emph{evidence}. A capsule must bind a declared schema digest so that a
+drifted schema is detectable; flexible-schema systems make that claim
+vacuous. Type coercion rules in document stores also undermine conservation
+checks (the algebraic sum-equality over overlaps needs exact numerics --
+hence \emph{decimal(p,s)}, not IEEE floats or ``whichever JSON number came
+through'').
+
+\subsection{``Just use DuckDB (or any OLAP engine).'''}
+Analytical engines answer queries over columnar data quickly; they do not
+publish custody. DuckDB inside the transformation step would be entirely
+compatible with SEAMDB -- indeed the natural place for heavy transforms --
+because SEAMDB's claim is about the \emph{boundary} (what left, under what
+policy, provable later), not about compute speed. If your only problem is
+fast analytics, do not add SEAMDB.
+
+\subsection{``Just add triggers and an audit table.''}
+Append-only audit tables are the most common real-world answer, and they
+fail the rewrite test: an operator with write access can rewrite the audit
+table too, and both tables will agree afterwards. Evidence requires a
+\emph{digest chain plus an append-only log whose checkpoints are signed and
+witnessed}, and verification must be runnable by the counterparty. SEAMDB is
+that, packaged: transparency log, witness acks, split detection, and an
+offline verifier whose exit code is the verdict.
+
+\subsection{``Just run a transparency log (or Sigstore) on the side.''}
+External transparency logs solve append-ordering and equivocation detection
+well, and SEAMDB's log is deliberately RFC-9162-shaped so a production
+deployment can \emph{replace} the local log with a public one. But a log
+proves \emph{that a statement was logged}, not that the statement is true:
+the log does not know that the capsule's result root came from the claimed
+source snapshot under the claimed policy. SEAMDB's contribution is the
+binding -- source snapshot, lineage, policy decision, appraisal, result --
+that makes the logged statement mean something. Logs and bindings are
+complementary; SEAMDB ships both and keeps the seam explicit.
+
+\subsection{``Just hash the CSV on export.''}
+This is the ``trust me'' answer in miniature: a file hash proves integrity
+since hashing, provenance not at all. It does not bind the inputs, the
+policy, the operator, or the time; it cannot detect that the same file was
+regenerated from different rows; and it cannot be checked without the
+sender's cooperation for context. The capsule is what ``hash the export''
+wants to be when it grows up.
+
+\subsection{Summary table}
+\begin{center}
+\small
+\begin{tabular}{@{}p{2.9cm}p{3.6cm}p{3.4cm}p{3.6cm}@{}}
+\toprule
+& Wins at & Does not answer & SEAMDB's stance \\
+\midrule
+Redis & microsecond cache/broker & durability windows; no typed queries; no
+  proofs & keep it as cache; not custody \\
+Postgres & general-purpose SoR, replication & no capsule, no offline
+  verification & assume as source; evidence layer sits above \\
+SQLite & embeddable single-file DB & no multi-writer; no evidence plane &
+  same embeddable spirit, plus fingerprints \\
+MongoDB & schema flexibility & schema-drift detection; exact numerics &
+  schema digest is part of the capsule \\
+DuckDB & analytics speed & custody of what left & welcome inside the
+  transform step \\
+Audit tables & cheap provenance theater & rewrite resistance & signed,
+  witnessed digest chain instead \\
+Public logs & append ordering, equivocation & truth of what was logged &
+  bind source/policy/result, then log \\
+Hash-the-CSV & transit integrity & provenance, policy, time & the capsule
+  is the finished form of this idea \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% =====================================================================
+\section{Advantages}
+\label{sec:advantages}
+
+\begin{enumerate}
+  \item \textbf{Proof-carrying exports.} Every release carries source
+    snapshot roots, lineage closure, policy digest, execution appraisal,
+    result root, and a transparency receipt -- one content-addressed object.
+  \item \textbf{Offline, counterparty-run verification.} The auditor runs
+    the verifier with no network and no call-back to the producer; exit
+    code 0 means every named check passed.
+  \item \textbf{Fail-closed by construction.} Missing dependencies never
+    roll up to PASS; \code{INDETERMINATE} is not a release signal; typed
+    errors (\code{E\_*}) replace crashes everywhere, including the WAL and
+    page layers.
+  \item \textbf{Tamper evidence with names, not vibes.} A mutated leaf,
+    swapped purpose, stale policy, replayed grant, or equivocating witness
+    each fails a specific named check; the attack gallery asserts all of
+    them stay blocked.
+  \item \textbf{Rewrite resistance.} The capsule digest covers every sealed
+    field; tests mutate each field individually and require the digest to
+    move. History rewrite requires forging SHA-384 or forging a checkpoint
+    signature -- and witnesses make even a signed fork detectable.
+  \item \textbf{Custody across systems.} Lineage edges are bound into the
+    capsule and checked acyclic; the same evidence story extends to
+    Postgres-sourced snapshots through connectors.
+  \item \textbf{Replay-proof releases.} One-use, digest-bound grants: a
+    consumed grant cannot be replayed, and a grant for another capsule
+    does not apply.
+  \item \textbf{Algorithm agility without overclaiming.} Classical and PQ
+    transport, signature algorithms -- all labeled per record, so the
+    deployment can upgrade primitives without the documentation rotting
+    into marketing.
+  \item \textbf{Runs where the evidence is discussed.} The identical
+    engine -- pages, WAL, MVCC, planner -- runs in Node, in the browser on the
+    site's five pages, and on the desktop through the wire protocol, so a buyer can execute the proof claims on the
+    site's SQL IDE and the PyQt6 Studio itself rather than trusting a demo video.
+  \item \textbf{Auditable surface.} Zero production npm dependencies (the
+    single crypto dependency, @noble/post-quantum, is a build-time
+    devDependency), no eval/dynamic code, ASCII-only sources, and a
+    test suite that runs fully offline. A reviewer can read the whole
+    system.
+\end{enumerate}
+
+% =====================================================================
+\section{Verification and evaluation}
+\label{sec:verification}
+
+\subsection{Implementation constraints, enforced by tests}
+\label{sec:constraints}
+A dedicated suite walks the source tree and fails the build on: \code{eval}
+and \code{Function} constructors, dynamic \code{require} or dynamic
+\code{import()} in engine code, WebAssembly, non-relative runtime imports in
+engine code, any production dependency in \code{package.json}, and
+non-ASCII bytes in any source file. These are injection-surface and supply
+chain constraints, checked mechanically rather than promised.
+
+\subsection{Test inventory (204 at time of writing)}
+Lexer and parser (grammar, spans, error positions), tuple/codec round-trips
+and bounds, page encode/decode with CRC failure paths, B$+$tree under random
+workloads, memory and encrypted pagers, engine semantics (constraints,
+joins, aggregates, planner), MVCC and transaction tests, crash matrix
+(adversarial WAL tear offsets), WAL rotation, protocol loop (framing,
+auth, idempotency, production-mode refusals, catalog introspection under
+role visibility), hybrid PQ handshake (both parties agree; downgrade
+attempts diverge), evidence pipeline end-to-end (capsule digest coverage
+per field; tamper detection), known-answer vectors, attack gallery
+($\geq 10$ attacks, all blocked), the LeetCode-183 demo proof, the Python
+client round-trip against the framed server, and the desktop IDE smoke
+harness that pattern-matches the Qt syntax highlighter against the
+canonical keyword surface. The Windows WebCrypto fallback suite pins the
+honest-labeling behavior on runtimes that lack X25519/Ed25519.
+
+\subsection{Browser portability findings}
+The same pipeline runs in the browser across the site's five pages (home,
+SQL IDE, SECP lab, specs, docs). Two browser-specific
+defects were found and fixed by that harness: (i) WebCrypto algorithm
+availability differs from Node -- solved by the probe-and-label fallbacks of
+Section~\ref{sec:crypto}; (ii) \code{CompressionStream} readable sides have
+a zero high-water mark in Chromium, so awaiting \code{write()} before
+attaching a consumer deadlocks -- the MDL scorer now attaches the consumer
+first. Both classes of bug are invisible to Node-only CI, which is why the
+browser run is part of the verification story, not decoration.
+
+A third defect was caught by the \emph{desktop} harness, not the browser:
+the wire server's CATALOG frame (type 8) introspected the connection's
+pre-AUTH anonymous session instead of opening a session with the authed
+identity, so the schema explorer always saw an empty catalog under an
+identityless skeleton. The Python round-trip exposed it, the fix routes
+introspection through \code{connect(identity)}, and the catalog now reports
+the caller's roles and only the tables that identity can see.
+
+% =====================================================================
+\section{Limitations (read this section)}
+\label{sec:limitations}
+
+\begin{itemize}
+  \item \textbf{Single writer.} The engine takes one writer thread; no
+    distributed consensus, no sharding. Target scale is bounded regulated
+    pipelines, not hyperscale OLTP.
+  \item \textbf{Synthetic demo estate.} The site's lab estate (48 opaque
+    member rows, three seeded disagreements) is labeled SYNTHETIC
+    throughout; capture lag and p95 verifier latency are targets, not
+    measurements on a real pipeline.
+  \item \textbf{Simulated KMS.} Key custody is envelope keys over real
+    AES-256-GCM in process; production HSM/KMS integration is specified,
+    not shipped.
+  \item \textbf{Simulated witnesses.} Witness acknowledgements are
+    HMAC-based stand-ins; quorum checking and split detection are real,
+    the federation is not.
+  \item \textbf{Host-local time.} Timestamps trust the host clock; a
+    trusted timestamping service is required for adversarial settings.
+  \item \textbf{Transport-only PQ.} No PQ signatures; ML-KEM protects
+    sessions, not artifacts.
+  \item \textbf{MDL is a heuristic.} The compression residual is an
+    anomaly score, explicitly not Kolmogorov complexity.
+  \item \textbf{Verifier trusts its own code.} A verifier checks evidence
+    correctly if its binary/source digest is pinned externally; the
+    self-digest is printed, the pinning ceremony is the adopter's.
+  \item \textbf{Not SQL-compatible.} SEAMQL is deliberately small; porting
+    arbitrary SQL is out of scope for 0.1.
+\end{itemize}
+
+% =====================================================================
+\section{Reproducing everything}
+\label{sec:repro}
+
+\begin{lstlisting}[language={},basicstyle=\ttfamily\small]
+npm install           # devDependencies only; no production deps
+npm run engine:test   # 204 tests: parser..protocol..gallery..drivers..ide
+npm run verify        # offline capsule verifier, exit 0 = full PASS
+npm run attacks       # adversarial gallery, all must be BLOCKED
+npm run vectors       # known-answer vectors
+npm run dev           # five-page site: home, IDE, lab, specs, docs
+
+# wire protocol + clients
+npx tsx src/server/tcp.ts --mem --port 7301
+python - <<'PY'
+import sys; sys.path.insert(0, 'drivers/python')
+import seamdb
+with seamdb.connect('127.0.0.1', 7301, user='root', roles=['owner']) as db:
+    db.query("spawn table t: id: whole number, main key, name: text, needed")
+    db.query("drop in t { id: 1, name: 'Ada' }")
+    print(db.query("pull name from t when id = 1").pop().rows)
+PY
+
+# desktop IDE (PyQt6 -- a window, not a web frame)
+python ide/seamdb_ide.py --host 127.0.0.1 --port 7301 \
+                         --user root --roles owner
+\end{lstlisting}
+
+Every command runs offline. The LeetCode-183 script shown in
+Section~\ref{sec:seamql} is executed verbatim by
+\code{tests/demo-proof.test.ts} and by the browser IDE, so the document, the
+page, and the engine cannot drift apart silently.
+
+% =====================================================================
+\section{References}
+\label{sec:refs}
+
+\begin{itemize}
+  \item RFC 8785 -- JSON Canonicalization Scheme (JCS).
+  \item RFC 9162 -- Certificate Transparency Version 2.0 (log shape,
+    inclusion/consistency proofs).
+  \item RFC 8032 -- EdDSA: Ed25519. \quad RFC 7748 -- X25519.
+  \item RFC 8446 -- TLS 1.3 (hybrid group design reference).
+  \item RFC 5869 -- HKDF. \quad NIST SP 800-38D -- AES-GCM.
+  \item FIPS 203 -- ML-KEM (module-lattice-based key-encapsulation).
+  \item FIPS 186-5 -- Digital Signature Standard (ECDSA, EdDSA).
+  \item RFC 9334 -- RATS architecture (appraisal reference model).
+  \item C. Mohan et al., ``ARIES: A Transaction Recovery Method Supporting
+    Fine-Granularity Locking \ldots'', ACM TODS 1992.
+  \item J. Rissanen, ``Modeling by Shortest Data Description'' (MDL).
+  \item @noble/post-quantum -- referenced ML-KEM-768 implementation.
+\end{itemize}
+
+\end{document}
